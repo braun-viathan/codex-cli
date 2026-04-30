@@ -11,6 +11,7 @@ use crate::types::AnalyticsConfigToml;
 use crate::types::ApprovalsReviewer;
 use crate::types::AppsConfigToml;
 use crate::types::AuthCredentialsStoreMode;
+use crate::types::CompactMode;
 use crate::types::FeedbackConfigToml;
 use crate::types::History;
 use crate::types::MarketplaceConfig;
@@ -238,6 +239,9 @@ pub struct ConfigToml {
 
     /// Compact prompt used for history compaction.
     pub compact_prompt: Option<String>,
+
+    /// Selects how Codex chooses the compaction implementation.
+    pub compact_mode: Option<CompactMode>,
 
     /// When set, restricts ChatGPT login to one or more workspace identifiers.
     #[serde(default)]

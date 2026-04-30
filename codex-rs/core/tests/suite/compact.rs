@@ -1,5 +1,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_config::types::CompactMode;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
@@ -838,7 +839,7 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manual_compact_uses_custom_prompt() {
+async fn manual_compact_forced_local_uses_custom_prompt_on_openai_provider() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -854,10 +855,11 @@ async fn manual_compact_uses_custom_prompt() {
 
     let custom_prompt = "Use this compact prompt instead";
 
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         config.compact_prompt = Some(custom_prompt.to_string());
+        config.compact_mode = CompactMode::Local;
     });
     let codex = builder
         .build(&server)
@@ -916,19 +918,11 @@ async fn manual_compact_uses_custom_prompt() {
         }
     }
 
-    let used_prompt = found_custom_prompt || found_default_prompt;
-    if used_prompt {
-        assert!(found_custom_prompt, "custom prompt should be injected");
-        assert!(
-            !found_default_prompt,
-            "default prompt should be replaced when a compact prompt is used"
-        );
-    } else {
-        assert!(
-            !found_default_prompt,
-            "summarization prompt should not appear if compaction omits a prompt"
-        );
-    }
+    assert!(found_custom_prompt, "custom prompt should be injected");
+    assert!(
+        !found_default_prompt,
+        "default prompt should be replaced when a compact prompt is used"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1617,7 +1611,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn auto_compact_runs_after_token_limit_hit() {
+async fn auto_compact_forced_local_runs_after_token_limit_hit() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -1644,11 +1638,12 @@ async fn auto_compact_runs_after_token_limit_hit() {
 
     let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
 
-    let model_provider = non_openai_model_provider(&server);
+    let model_provider = openai_model_provider(&server);
 
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
+        config.compact_mode = CompactMode::Local;
         config.model_auto_compact_token_limit = Some(200_000);
     });
     let codex = builder.build(&server).await.unwrap().codex;

@@ -28,6 +28,8 @@ use codex_analytics::CompactionStatus;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
+use codex_config::types::CompactMode;
+use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
@@ -100,6 +102,16 @@ pub(crate) async fn build_compaction_initial_context(
             (items, Some(Arc::clone(world_state)))
         }
         InitialContextInjection::DoNotInject => (Vec::new(), None),
+    }
+}
+
+pub(crate) fn remote_compaction_support_for_mode(
+    support: RemoteCompactionSupport,
+    compact_mode: CompactMode,
+) -> RemoteCompactionSupport {
+    match compact_mode {
+        CompactMode::Auto => support,
+        CompactMode::Local => RemoteCompactionSupport::Unsupported,
     }
 }
 

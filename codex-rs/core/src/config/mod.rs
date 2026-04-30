@@ -36,6 +36,7 @@ use codex_config::sandbox_mode_requirement_for_permission_profile;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_config::types::AuthKeyringBackendKind;
+use codex_config::types::CompactMode;
 use codex_config::types::History;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerDisabledReason;
@@ -725,6 +726,9 @@ pub struct Config {
 
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
+
+    /// Compaction implementation selection.
+    pub compact_mode: CompactMode,
 
     /// Optional external notifier command. When set, Codex will spawn this
     /// program after each completed *turn* (i.e. when the agent finishes
@@ -3974,6 +3978,7 @@ impl Config {
         )
         .await?;
         let compact_prompt = compact_prompt.or(file_compact_prompt);
+        let compact_mode = cfg.compact_mode.unwrap_or_default();
         let zsh_path = default_zsh_path
             .or_else(|| InstallContext::current().bundled_zsh_path())
             .map(AbsolutePathBuf::into_path_buf);
@@ -4148,6 +4153,7 @@ impl Config {
             personality,
             developer_instructions,
             compact_prompt,
+            compact_mode,
             include_permissions_instructions,
             include_apps_instructions,
             include_collaboration_mode_instructions,

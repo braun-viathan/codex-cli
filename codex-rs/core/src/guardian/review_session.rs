@@ -8,6 +8,7 @@ use anyhow::anyhow;
 use codex_analytics::GuardianReviewAnalyticsResult;
 use codex_analytics::GuardianReviewSessionAnalyticsParams;
 use codex_analytics::GuardianReviewSessionKind;
+use codex_config::types::CompactMode;
 use codex_extension_api::UserInstructions;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
@@ -170,6 +171,7 @@ struct GuardianReviewSessionReuseKey {
     developer_instructions: Option<String>,
     base_instructions: Option<String>,
     user_instructions: Option<UserInstructions>,
+    compact_mode: CompactMode,
     compact_prompt: Option<String>,
     cwd: PathUri,
     mcp_servers: Constrained<HashMap<String, McpServerConfig>>,
@@ -207,6 +209,7 @@ impl GuardianReviewSessionReuseKey {
             developer_instructions: spawn_config.developer_instructions.clone(),
             base_instructions: spawn_config.base_instructions.clone(),
             user_instructions,
+            compact_mode: spawn_config.compact_mode,
             compact_prompt: spawn_config.compact_prompt.clone(),
             cwd: PathUri::from_abs_path(&spawn_config.cwd),
             mcp_servers: spawn_config.mcp_servers.clone(),

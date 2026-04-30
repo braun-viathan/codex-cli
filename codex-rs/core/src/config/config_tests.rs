@@ -41,6 +41,7 @@ use codex_config::permissions_toml::WorkspaceRootsToml;
 use codex_config::types::AppToolApproval;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::BundledSkillsConfig;
+use codex_config::types::CompactMode;
 use codex_config::types::FeedbackConfigToml;
 use codex_config::types::HistoryPersistence;
 use codex_config::types::McpServerEnvVar;
@@ -7616,6 +7617,26 @@ async fn loads_compact_prompt_from_file() -> std::io::Result<()> {
         config.compact_prompt.as_deref(),
         Some("summarize differently")
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_mode_loads_from_config_toml() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        compact_mode: Some(CompactMode::Local),
+        ..Default::default()
+    };
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(config.compact_mode, CompactMode::Local);
 
     Ok(())
 }

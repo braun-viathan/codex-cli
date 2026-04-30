@@ -1,4 +1,6 @@
 use super::*;
+use codex_config::types::CompactMode;
+use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
@@ -262,6 +264,24 @@ fn build_compacted_history_preserves_user_message_passthrough_metadata() {
 
     assert_eq!(history[0].turn_id(), Some("turn-1"));
     assert_eq!(history[1].turn_id(), None);
+}
+
+#[test]
+fn compact_mode_preserves_or_disables_provider_capability() {
+    for support in [
+        RemoteCompactionSupport::Unsupported,
+        RemoteCompactionSupport::V1,
+        RemoteCompactionSupport::V2,
+    ] {
+        assert_eq!(
+            remote_compaction_support_for_mode(support, CompactMode::Auto),
+            support
+        );
+        assert_eq!(
+            remote_compaction_support_for_mode(support, CompactMode::Local),
+            RemoteCompactionSupport::Unsupported
+        );
+    }
 }
 
 #[tokio::test]

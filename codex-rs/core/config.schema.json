@@ -404,6 +404,13 @@
       },
       "type": "object"
     },
+    "CompactMode": {
+      "enum": [
+        "auto",
+        "local"
+      ],
+      "type": "string"
+    },
     "ConfigProfile": {
       "additionalProperties": false,
       "description": "Collection of common configuration options that a user can define as a unit in `config.toml`.",
@@ -419,6 +426,9 @@
         },
         "chatgpt_base_url": {
           "type": "string"
+        },
+        "compact_mode": {
+          "$ref": "#/definitions/CompactMode"
         },
         "experimental_compact_prompt_file": {
           "$ref": "#/definitions/AbsolutePathBuf"
@@ -5020,6 +5030,14 @@
       ],
       "default": null,
       "description": "Preferred backend for storing CLI auth credentials. file (default): Use a file in the Codex home directory. keyring: Use an OS-specific keyring service. auto: Use the keyring if available, otherwise use a file."
+    },
+    "compact_mode": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CompactMode"
+        }
+      ],
+      "description": "Selects how Codex chooses the compaction implementation."
     },
     "compact_prompt": {
       "description": "Compact prompt used for history compaction.",

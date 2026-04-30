@@ -8,6 +8,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::collect_explicit_skill_mentions;
 use crate::compact::InitialContextInjection;
+use crate::compact::remote_compaction_support_for_mode;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
@@ -1179,7 +1180,10 @@ async fn run_auto_compact(
         return Ok(());
     }
 
-    match turn_context.provider.capabilities().remote_compaction {
+    match remote_compaction_support_for_mode(
+        turn_context.provider.capabilities().remote_compaction,
+        turn_context.config.compact_mode,
+    ) {
         RemoteCompactionSupport::V2
             if turn_context
                 .config
