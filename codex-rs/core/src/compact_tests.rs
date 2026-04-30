@@ -1,5 +1,6 @@
 use super::*;
 use crate::session::tests::build_world_state_from_turn_context;
+use codex_config::types::CompactMode;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::ResponseItemId;
@@ -279,7 +280,39 @@ fn should_use_remote_compact_task_for_azure_provider() {
         supports_websockets: false,
     };
 
-    assert!(should_use_remote_compact_task(&provider));
+    assert!(should_use_remote_compact_task(&provider, CompactMode::Auto));
+}
+
+#[test]
+fn should_force_local_or_remote_compact_from_config() {
+    let provider = ModelProviderInfo {
+        name: "Azure".into(),
+        base_url: Some("https://example.com/openai".into()),
+        env_key: Some("AZURE_OPENAI_API_KEY".into()),
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        auth: None,
+        aws: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        websocket_connect_timeout_ms: None,
+        requires_openai_auth: false,
+        supports_websockets: false,
+    };
+
+    assert!(should_use_remote_compact_task(
+        &provider,
+        CompactMode::Remote
+    ));
+    assert!(!should_use_remote_compact_task(
+        &provider,
+        CompactMode::Local
+    ));
 }
 #[tokio::test]
 async fn process_compacted_history_replaces_developer_messages() {

@@ -26,6 +26,7 @@ use codex_analytics::CompactionStatus;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
+use codex_config::types::CompactMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -85,8 +86,15 @@ pub(crate) async fn build_compaction_initial_context(
     }
 }
 
-pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
-    provider.supports_remote_compaction()
+pub(crate) fn should_use_remote_compact_task(
+    provider: &ModelProviderInfo,
+    compact_mode: CompactMode,
+) -> bool {
+    match compact_mode {
+        CompactMode::Auto => provider.supports_remote_compaction(),
+        CompactMode::Remote => true,
+        CompactMode::Local => false,
+    }
 }
 
 pub(crate) async fn run_inline_auto_compact_task(

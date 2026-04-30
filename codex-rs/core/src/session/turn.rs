@@ -984,7 +984,10 @@ async fn run_auto_compact(
         return Ok(());
     }
 
-    if should_use_remote_compact_task(turn_context.provider.info()) {
+    if should_use_remote_compact_task(
+        turn_context.provider.info(),
+        turn_context.config.compact_mode,
+    ) {
         if turn_context
             .config
             .features

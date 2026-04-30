@@ -37,7 +37,10 @@ impl SessionTask for CompactTask {
             return Ok(None);
         }
 
-        let result = if crate::compact::should_use_remote_compact_task(ctx.provider.info()) {
+        let result = if crate::compact::should_use_remote_compact_task(
+            ctx.provider.info(),
+            ctx.config.compact_mode,
+        ) {
             if ctx
                 .config
                 .features

@@ -6,6 +6,16 @@ For advanced configuration instructions, see [this documentation](https://develo
 
 For a full configuration reference, see [this documentation](https://developers.openai.com/codex/config-reference).
 
+## Compaction
+
+Codex chooses between local and remote history compaction automatically by
+default. Set `compact_mode` when you need to override that selection:
+
+```toml
+compact_mode = "local" # "auto", "local", or "remote"
+experimental_compact_prompt_file = "/absolute/path/to/compact-prompt.md"
+```
+
 ## Lifecycle hooks
 
 Admins can set top-level `allow_managed_hooks_only = true` in
