@@ -53,6 +53,39 @@ pub enum LifecycleStatus {
     Running,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CodexBinaryKind {
+    Managed,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexBinarySource {
+    kind: CodexBinaryKind,
+    path: PathBuf,
+}
+
+impl CodexBinarySource {
+    fn managed(path: PathBuf) -> Self {
+        Self {
+            kind: CodexBinaryKind::Managed,
+            path,
+        }
+    }
+
+    fn custom(path: PathBuf) -> Self {
+        Self {
+            kind: CodexBinaryKind::Custom,
+            path,
+        }
+    }
+
+    fn auto_update_enabled(&self) -> bool {
+        matches!(self.kind, CodexBinaryKind::Managed)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LifecycleOutput {
@@ -61,8 +94,12 @@ pub struct LifecycleOutput {
     pub backend: Option<BackendKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    pub codex_binary_kind: CodexBinaryKind,
+    pub codex_binary_path: PathBuf,
+    pub codex_binary_version: Option<String>,
     pub managed_codex_path: PathBuf,
     pub managed_codex_version: Option<String>,
+    pub auto_update_enabled: bool,
     pub socket_path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_version: Option<String>,
@@ -70,9 +107,16 @@ pub struct LifecycleOutput {
     pub app_server_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapOptions {
     pub remote_control_enabled: bool,
+    pub codex_binary_override: Option<BootstrapCodexBinaryOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapCodexBinaryOverride {
+    Managed,
+    Custom(PathBuf),
 }
 
 /// Passively probes an existing app-server socket and returns its reported
@@ -94,6 +138,9 @@ pub struct BootstrapOutput {
     pub backend: BackendKind,
     pub auto_update_enabled: bool,
     pub remote_control_enabled: bool,
+    pub codex_binary_kind: CodexBinaryKind,
+    pub codex_binary_path: PathBuf,
+    pub codex_binary_version: Option<String>,
     pub managed_codex_path: PathBuf,
     pub managed_codex_version: Option<String>,
     pub socket_path: PathBuf,
@@ -324,8 +371,9 @@ impl Daemon {
                 .await);
         }
 
-        self.ensure_managed_codex_bin()?;
-        let pid = self.start_managed_backend(&settings).await?;
+        let codex_bin = self.codex_bin_source(&settings);
+        self.ensure_codex_bin(&codex_bin)?;
+        let pid = self.start_backend(&settings).await?;
         let info = self.wait_until_ready().await?;
         Ok(self
             .output(
@@ -347,12 +395,13 @@ impl Daemon {
             ));
         }
 
-        self.ensure_managed_codex_bin()?;
+        let codex_bin = self.codex_bin_source(&settings);
+        self.ensure_codex_bin(&codex_bin)?;
         if let Some(backend) = self.running_backend_instance(&settings).await? {
             backend.stop().await?;
         }
 
-        let pid = self.start_managed_backend(&settings).await?;
+        let pid = self.start_backend(&settings).await?;
         let info = self.wait_until_ready().await?;
         Ok(self
             .output(
@@ -408,6 +457,11 @@ impl Daemon {
         }
 
         Ok(outcome)
+    }
+
+    pub(crate) async fn auto_update_enabled(&self) -> Result<bool> {
+        let settings = self.load_settings().await?;
+        Ok(self.codex_bin_source(&settings).auto_update_enabled())
     }
 
     async fn stop(&self) -> Result<LifecycleOutput> {
@@ -481,13 +535,17 @@ impl Daemon {
     }
 
     async fn append_daemon_app_server_context(&self, context: &mut String) {
-        let managed_codex_version = self
-            .managed_codex_version_best_effort()
+        let settings = self.load_settings().await.unwrap_or_default();
+        let codex_bin = self.codex_bin_source(&settings);
+        let codex_version = self
+            .codex_version_best_effort(&codex_bin)
             .await
             .unwrap_or_else(|| "unknown".to_string());
         context.push_str(&format!(
-            "\n\nDaemon used app-server:\n  path: {}\n  version: {managed_codex_version}",
-            self.managed_codex_bin.display()
+            "\n\nDaemon used app-server:\n  kind: {:?}\n  path: {}\n  version: {codex_version}\n  auto-update: {}",
+            codex_bin.kind,
+            codex_bin.path.display(),
+            codex_bin.auto_update_enabled()
         ));
     }
 
@@ -510,6 +568,7 @@ impl Daemon {
         let output = self
             .bootstrap_locked(BootstrapOptions {
                 remote_control_enabled: true,
+                codex_binary_override: None,
             })
             .await?;
         Ok(RemoteControlStartOutput::Bootstrap(output))
@@ -573,9 +632,10 @@ impl Daemon {
         settings.save(&self.settings_file).await?;
 
         let app_server_version = if let Some(backend) = backend {
-            self.ensure_managed_codex_bin()?;
+            let codex_bin = self.codex_bin_source(&settings);
+            self.ensure_codex_bin(&codex_bin)?;
             backend.stop().await?;
-            let _ = self.start_managed_backend(&settings).await?;
+            let _ = self.start_backend(&settings).await?;
             Some(self.wait_until_ready().await?.app_server_version)
         } else {
             None
@@ -590,11 +650,16 @@ impl Daemon {
     }
 
     async fn bootstrap_locked(&self, options: BootstrapOptions) -> Result<BootstrapOutput> {
-        self.ensure_managed_codex_bin()?;
-
+        let previous_settings = self.load_settings().await?;
         let settings = DaemonSettings {
             remote_control_enabled: options.remote_control_enabled,
+            custom_codex_bin: bootstrap_custom_codex_bin(
+                options.codex_binary_override,
+                previous_settings.custom_codex_bin,
+            ),
         };
+        let codex_bin = self.codex_bin_source(&settings);
+        self.ensure_codex_bin(&codex_bin)?;
         if client::probe(&self.socket_path).await.is_ok()
             && self.running_backend(&settings).await?.is_none()
         {
@@ -602,27 +667,56 @@ impl Daemon {
                 "app server is running but is not managed by codex app-server daemon"
             ));
         }
-        settings.save(&self.settings_file).await?;
-
         if let Some(backend) = self.running_backend_instance(&settings).await? {
             backend.stop().await?;
         }
 
-        let backend = backend::pid_backend(self.backend_paths(&settings));
+        let backend_paths = self.backend_paths(&settings);
+        let backend = backend::pid_backend(backend_paths.clone());
         backend.start().await?;
-        let updater = backend::pid_update_loop_backend(self.backend_paths(&settings));
-        if updater.is_starting_or_running().await? {
-            updater.stop().await?;
+        let updater = backend::pid_update_loop_backend(backend_paths.clone());
+        let updater_running = match updater.is_starting_or_running().await {
+            Ok(updater_running) => updater_running,
+            Err(err) => {
+                let _ = backend.stop().await;
+                return Err(err);
+            }
+        };
+        if updater_running && let Err(err) = updater.stop().await {
+            let _ = backend.stop().await;
+            return Err(err);
         }
-        updater.start().await?;
+        if codex_bin.auto_update_enabled()
+            && let Err(err) = updater.start().await
+        {
+            let _ = backend.stop().await;
+            return Err(err);
+        }
 
-        let info = self.wait_until_ready().await?;
+        let info = match self.wait_until_ready().await {
+            Ok(info) => info,
+            Err(err) => {
+                let _ = backend.stop().await;
+                let _ = updater.stop().await;
+                return Err(err);
+            }
+        };
+        if let Err(err) = settings.save(&self.settings_file).await {
+            let _ = backend.stop().await;
+            let _ = updater.stop().await;
+            return Err(err);
+        }
+        let codex_binary_version = self.codex_version_best_effort(&codex_bin).await;
         let managed_codex_version = self.managed_codex_version_best_effort().await;
+        let auto_update_enabled = codex_bin.auto_update_enabled();
         Ok(BootstrapOutput {
             status: BootstrapStatus::Bootstrapped,
             backend: BackendKind::Pid,
-            auto_update_enabled: true,
+            auto_update_enabled,
             remote_control_enabled: settings.remote_control_enabled,
+            codex_binary_kind: codex_bin.kind,
+            codex_binary_path: codex_bin.path,
+            codex_binary_version,
             managed_codex_path: self.managed_codex_bin.clone(),
             managed_codex_version,
             socket_path: self.socket_path.clone(),
@@ -649,39 +743,64 @@ impl Daemon {
         Ok(None)
     }
 
-    async fn start_managed_backend(&self, settings: &DaemonSettings) -> Result<Option<u32>> {
-        self.start_managed_backend_with_bin(settings, &self.managed_codex_bin)
+    async fn start_backend(&self, settings: &DaemonSettings) -> Result<Option<u32>> {
+        let codex_bin = self.codex_bin_source(settings);
+        self.start_managed_backend_with_bin(settings, &codex_bin.path)
             .await
     }
 
     async fn start_managed_backend_with_bin(
         &self,
         settings: &DaemonSettings,
-        managed_codex_bin: &Path,
+        codex_bin: &Path,
     ) -> Result<Option<u32>> {
-        let backend =
-            backend::pid_backend(self.backend_paths_with_bin(settings, managed_codex_bin));
+        let backend = backend::pid_backend(self.backend_paths_with_bin(settings, codex_bin));
         backend.start().await
     }
 
     async fn is_bootstrapped(&self, settings: &DaemonSettings) -> Result<bool> {
+        if !self.codex_bin_source(settings).auto_update_enabled() {
+            return Ok(settings.custom_codex_bin.is_some());
+        }
         let updater = backend::pid_update_loop_backend(self.backend_paths(settings));
         updater.is_starting_or_running().await
     }
 
-    fn ensure_managed_codex_bin(&self) -> Result<()> {
-        if self.managed_codex_bin.is_file() {
+    fn ensure_codex_bin(&self, codex_bin: &CodexBinarySource) -> Result<()> {
+        match codex_bin.kind {
+            CodexBinaryKind::Managed => self.ensure_managed_codex_bin(codex_bin.path.as_path()),
+            CodexBinaryKind::Custom => ensure_custom_codex_bin(codex_bin.path.as_path()),
+        }
+    }
+
+    fn ensure_managed_codex_bin(&self, managed_codex_bin: &Path) -> Result<()> {
+        if managed_codex_bin.is_file() {
             return Ok(());
         }
 
-        let managed_codex_path = self.managed_codex_bin.display();
+        let managed_codex_path = managed_codex_bin.display();
         Err(anyhow!(
             "managed standalone Codex install not found at {managed_codex_path}\n\n\
              This command requires the standalone install managed by the Codex installer, because \
              the daemon starts and updates app-server from that fixed path.\n\n\
              Install it with:\n  curl -fsSL https://chatgpt.com/codex/install.sh | sh\n\n\
-             Then rerun the command you just tried."
+             Then rerun the command you just tried.\n\n\
+             To run a source-built Codex fork instead, bootstrap the daemon with:\n  \
+             codex app-server daemon bootstrap --codex-bin /absolute/path/to/codex"
         ))
+    }
+
+    fn codex_bin_source(&self, settings: &DaemonSettings) -> CodexBinarySource {
+        if let Some(custom_codex_bin) = &settings.custom_codex_bin {
+            return CodexBinarySource::custom(custom_codex_bin.clone());
+        }
+
+        CodexBinarySource::managed(self.managed_codex_bin.clone())
+    }
+
+    #[cfg(unix)]
+    async fn codex_version_best_effort(&self, codex_bin: &CodexBinarySource) -> Option<String> {
+        managed_codex_version(&codex_bin.path).await.ok()
     }
 
     #[cfg(unix)]
@@ -690,12 +809,18 @@ impl Daemon {
     }
 
     #[cfg(not(unix))]
+    async fn codex_version_best_effort(&self, _codex_bin: &CodexBinarySource) -> Option<String> {
+        None
+    }
+
+    #[cfg(not(unix))]
     async fn managed_codex_version_best_effort(&self) -> Option<String> {
         None
     }
 
     fn backend_paths(&self, settings: &DaemonSettings) -> BackendPaths {
-        self.backend_paths_with_bin(settings, &self.managed_codex_bin)
+        let codex_bin = self.codex_bin_source(settings);
+        self.backend_paths_with_bin(settings, &codex_bin.path)
     }
 
     fn backend_paths_with_bin(
@@ -760,13 +885,21 @@ impl Daemon {
         pid: Option<u32>,
         app_server_version: Option<String>,
     ) -> LifecycleOutput {
+        let settings = self.load_settings().await.unwrap_or_default();
+        let codex_bin = self.codex_bin_source(&settings);
+        let codex_binary_version = self.codex_version_best_effort(&codex_bin).await;
         let managed_codex_version = self.managed_codex_version_best_effort().await;
+        let auto_update_enabled = codex_bin.auto_update_enabled();
         LifecycleOutput {
             status,
             backend,
             pid,
+            codex_binary_kind: codex_bin.kind,
+            codex_binary_path: codex_bin.path,
+            codex_binary_version,
             managed_codex_path: self.managed_codex_bin.clone(),
             managed_codex_version,
+            auto_update_enabled,
             socket_path: self.socket_path.clone(),
             cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             app_server_version,
@@ -803,6 +936,56 @@ fn already_remote_control_status(mode: RemoteControlMode) -> RemoteControlStatus
         RemoteControlMode::Enabled => RemoteControlStatus::AlreadyEnabled,
         RemoteControlMode::Disabled => RemoteControlStatus::AlreadyDisabled,
     }
+}
+
+fn bootstrap_custom_codex_bin(
+    override_source: Option<BootstrapCodexBinaryOverride>,
+    previous_custom_codex_bin: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match override_source {
+        Some(BootstrapCodexBinaryOverride::Managed) => None,
+        Some(BootstrapCodexBinaryOverride::Custom(path)) => Some(path),
+        None => previous_custom_codex_bin,
+    }
+}
+
+fn ensure_custom_codex_bin(codex_bin: &Path) -> Result<()> {
+    if !codex_bin.is_absolute() {
+        return Err(anyhow!(
+            "custom Codex binary path must be absolute: {}",
+            codex_bin.display()
+        ));
+    }
+
+    if !codex_bin.is_file() {
+        return Err(anyhow!(
+            "custom Codex binary not found at {}",
+            codex_bin.display()
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(codex_bin)
+            .with_context(|| {
+                format!(
+                    "failed to read custom Codex binary metadata {}",
+                    codex_bin.display()
+                )
+            })?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            return Err(anyhow!(
+                "custom Codex binary is not executable: {}",
+                codex_bin.display()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -858,8 +1041,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::BackendKind;
+    use super::BootstrapCodexBinaryOverride;
     use super::BootstrapOutput;
     use super::BootstrapStatus;
+    use super::CodexBinaryKind;
     use super::Daemon;
     use super::LifecycleOutput;
     use super::LifecycleStatus;
@@ -869,9 +1054,11 @@ mod tests {
     use super::RestartIfRunningOutcome;
     use super::RestartMode;
     use super::UpdaterRefreshMode;
+    use super::bootstrap_custom_codex_bin;
     use super::restart_decision;
     use super::should_reexec_updater;
     use crate::client::ProbeInfo;
+    use crate::settings::DaemonSettings;
 
     #[test]
     fn remote_control_status_uses_camel_case_json() {
@@ -953,8 +1140,12 @@ mod tests {
             status: LifecycleStatus::AlreadyRunning,
             backend: Some(BackendKind::Pid),
             pid: None,
+            codex_binary_kind: CodexBinaryKind::Managed,
+            codex_binary_path: "codex".into(),
+            codex_binary_version: Some("1.2.3".to_string()),
             managed_codex_path: "codex".into(),
             managed_codex_version: Some("1.2.3".to_string()),
+            auto_update_enabled: true,
             socket_path: "codex.sock".into(),
             cli_version: Some("1.2.3".to_string()),
             app_server_version: Some("1.2.4".to_string()),
@@ -966,8 +1157,12 @@ mod tests {
             serde_json::json!({
                 "status": "alreadyRunning",
                 "backend": "pid",
+                "codexBinaryKind": "managed",
+                "codexBinaryPath": "codex",
+                "codexBinaryVersion": "1.2.3",
                 "managedCodexPath": "codex",
                 "managedCodexVersion": "1.2.3",
+                "autoUpdateEnabled": true,
                 "socketPath": "codex.sock",
                 "cliVersion": "1.2.3",
                 "appServerVersion": "1.2.4",
@@ -983,6 +1178,9 @@ mod tests {
             backend: BackendKind::Pid,
             auto_update_enabled: true,
             remote_control_enabled: true,
+            codex_binary_kind: CodexBinaryKind::Managed,
+            codex_binary_path: "codex".into(),
+            codex_binary_version: Some("1.2.3".to_string()),
             managed_codex_path: "codex".into(),
             managed_codex_version: Some("1.2.3".to_string()),
             socket_path: "codex.sock".into(),
@@ -998,6 +1196,9 @@ mod tests {
                 "backend": "pid",
                 "autoUpdateEnabled": true,
                 "remoteControlEnabled": true,
+                "codexBinaryKind": "managed",
+                "codexBinaryPath": "codex",
+                "codexBinaryVersion": "1.2.3",
                 "managedCodexPath": "codex",
                 "managedCodexVersion": "1.2.3",
                 "socketPath": "codex.sock",
@@ -1031,12 +1232,65 @@ mod tests {
             daemon.app_server_not_ready_context().await,
             format!(
                 "app server did not become ready on {}\n\n\
-                 Daemon used app-server:\n  path: {}\n  version: unknown\n\n\
+                 Daemon used app-server:\n  kind: Managed\n  path: {}\n  version: unknown\n  auto-update: true\n\n\
                  Managed app-server stderr ({}):\n  unexpected argument",
                 daemon.socket_path.display(),
                 daemon.managed_codex_bin.display(),
                 stderr_log.display()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_update_enabled_follows_configured_binary_source() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let daemon = Daemon {
+            socket_path: temp_dir.path().join("app-server-control.sock"),
+            pid_file: temp_dir.path().join("app-server.pid"),
+            update_pid_file: temp_dir.path().join("app-server-updater.pid"),
+            operation_lock_file: temp_dir.path().join("daemon.lock"),
+            settings_file: temp_dir.path().join("settings.json"),
+            managed_codex_bin: temp_dir.path().join("managed-codex"),
+        };
+
+        DaemonSettings {
+            remote_control_enabled: true,
+            custom_codex_bin: None,
+        }
+        .save(&daemon.settings_file)
+        .await
+        .expect("save managed settings");
+        assert!(daemon.auto_update_enabled().await.expect("managed mode"));
+
+        DaemonSettings {
+            remote_control_enabled: true,
+            custom_codex_bin: Some(temp_dir.path().join("custom-codex")),
+        }
+        .save(&daemon.settings_file)
+        .await
+        .expect("save custom settings");
+        assert!(!daemon.auto_update_enabled().await.expect("custom mode"));
+    }
+
+    #[test]
+    fn bootstrap_custom_codex_bin_preserves_or_overrides_settings() {
+        assert_eq!(
+            bootstrap_custom_codex_bin(None, Some("/old/codex".into())),
+            Some("/old/codex".into())
+        );
+        assert_eq!(
+            bootstrap_custom_codex_bin(
+                Some(BootstrapCodexBinaryOverride::Custom("/new/codex".into())),
+                Some("/old/codex".into()),
+            ),
+            Some("/new/codex".into())
+        );
+        assert_eq!(
+            bootstrap_custom_codex_bin(
+                Some(BootstrapCodexBinaryOverride::Managed),
+                Some("/old/codex".into()),
+            ),
+            None
         );
     }
 }

@@ -6,6 +6,7 @@ use clap::Args;
 use codex_app_server::AppServerRuntimeOptions;
 use codex_app_server::AppServerTransport;
 use codex_app_server::AppServerWebsocketAuthSettings;
+use codex_app_server_daemon::CodexBinaryKind as AppServerCodexBinaryKind;
 use codex_app_server_daemon::LifecycleCommand as AppServerLifecycleCommand;
 use codex_app_server_daemon::LifecycleOutput as AppServerLifecycleOutput;
 use codex_app_server_daemon::LifecycleStatus as AppServerLifecycleStatus;
@@ -424,25 +425,37 @@ fn remote_control_start_human_lines(
 }
 
 fn daemon_app_server_human_lines(output: &AppServerRemoteControlStartOutput) -> Vec<String> {
-    let (managed_codex_path, managed_codex_version) = daemon_app_server_identity(output);
+    let (codex_binary_kind, codex_binary_path, codex_binary_version, auto_update_enabled) =
+        daemon_app_server_identity(output);
     vec![
         "Daemon used app-server:".to_string(),
-        format!("  path: {}", managed_codex_path.display()),
-        format!("  version: {}", managed_codex_version.unwrap_or("unknown")),
+        format!("  kind: {codex_binary_kind:?}"),
+        format!("  path: {}", codex_binary_path.display()),
+        format!("  version: {}", codex_binary_version.unwrap_or("unknown")),
+        format!("  auto-update: {auto_update_enabled}"),
     ]
 }
 
 fn daemon_app_server_identity(
     output: &AppServerRemoteControlStartOutput,
-) -> (&std::path::Path, Option<&str>) {
+) -> (
+    AppServerCodexBinaryKind,
+    &std::path::Path,
+    Option<&str>,
+    bool,
+) {
     match output {
         AppServerRemoteControlStartOutput::Bootstrap(output) => (
-            &output.managed_codex_path,
-            output.managed_codex_version.as_deref(),
+            output.codex_binary_kind,
+            &output.codex_binary_path,
+            output.codex_binary_version.as_deref(),
+            output.auto_update_enabled,
         ),
         AppServerRemoteControlStartOutput::Start(output) => (
-            &output.managed_codex_path,
-            output.managed_codex_version.as_deref(),
+            output.codex_binary_kind,
+            &output.codex_binary_path,
+            output.codex_binary_version.as_deref(),
+            output.auto_update_enabled,
         ),
     }
 }
@@ -526,8 +539,12 @@ mod tests {
                 status: AppServerLifecycleStatus::Started,
                 backend: None,
                 pid: Some(42),
+                codex_binary_kind: AppServerCodexBinaryKind::Managed,
+                codex_binary_path: PathBuf::from("/opt/codex/bin/codex"),
+                codex_binary_version: Some("1.0.0".to_string()),
                 managed_codex_path: PathBuf::from("/opt/codex/bin/codex"),
                 managed_codex_version: Some("1.0.0".to_string()),
+                auto_update_enabled: true,
                 socket_path: PathBuf::from("/tmp/app-server-control.sock"),
                 cli_version: Some("1.0.0".to_string()),
                 app_server_version: Some("2.0.0".to_string()),
@@ -611,8 +628,10 @@ mod tests {
             ),
             vec![
                 "Daemon used app-server:".to_string(),
+                "  kind: Managed".to_string(),
                 "  path: /opt/codex/bin/codex".to_string(),
                 "  version: 1.0.0".to_string(),
+                "  auto-update: true".to_string(),
             ]
         );
     }
@@ -647,8 +666,12 @@ mod tests {
                 "daemon": {
                     "status": "started",
                     "pid": 42,
+                    "codexBinaryKind": "managed",
+                    "codexBinaryPath": "/opt/codex/bin/codex",
+                    "codexBinaryVersion": "1.0.0",
                     "managedCodexPath": "/opt/codex/bin/codex",
                     "managedCodexVersion": "1.0.0",
+                    "autoUpdateEnabled": true,
                     "socketPath": "/tmp/app-server-control.sock",
                     "cliVersion": "1.0.0",
                     "appServerVersion": "2.0.0",

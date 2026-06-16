@@ -82,6 +82,7 @@ async fn sleep_or_terminate(duration: Duration, terminate: &mut Signal) -> bool 
 }
 
 #[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
 enum UpdateLoopControl {
     Continue,
     Stop,
@@ -92,9 +93,22 @@ async fn update_once(
     running_updater_identity: &ExecutableIdentity,
     terminate: &mut Signal,
 ) -> Result<UpdateLoopControl> {
+    let daemon = Daemon::from_environment()?;
+    update_once_for_daemon(&daemon, running_updater_identity, terminate).await
+}
+
+#[cfg(unix)]
+async fn update_once_for_daemon(
+    daemon: &Daemon,
+    running_updater_identity: &ExecutableIdentity,
+    terminate: &mut Signal,
+) -> Result<UpdateLoopControl> {
+    if !daemon.auto_update_enabled().await? {
+        return Ok(UpdateLoopControl::Stop);
+    }
+
     install_latest_standalone().await?;
 
-    let daemon = Daemon::from_environment()?;
     let managed_codex_bin = resolved_managed_codex_bin(&daemon.managed_codex_bin).await?;
     let managed_identity = executable_identity(&managed_codex_bin).await?;
     let (restart_mode, updater_refresh_mode) =

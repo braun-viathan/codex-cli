@@ -3,6 +3,7 @@ use clap::CommandFactory;
 use clap::Parser;
 use clap_complete::Shell;
 use clap_complete::generate;
+use codex_app_server_daemon::BootstrapCodexBinaryOverride as AppServerBootstrapCodexBinaryOverride;
 use codex_app_server_daemon::BootstrapOptions as AppServerBootstrapOptions;
 use codex_app_server_daemon::LifecycleCommand as AppServerLifecycleCommand;
 use codex_app_server_daemon::RemoteControlMode as AppServerRemoteControlMode;
@@ -650,9 +651,22 @@ struct AppServerProxyCommand {
 
 #[derive(Debug, Args)]
 struct AppServerBootstrapCommand {
-    /// Launch the managed app-server with remote control enabled.
+    /// Enable remote control when bootstrapping the app-server daemon.
     #[arg(long = "remote-control")]
     remote_control: bool,
+
+    /// Persist a custom Codex binary for daemon-managed app-server starts.
+    #[arg(
+        long = "codex-bin",
+        value_name = "PATH",
+        value_parser = parse_absolute_codex_bin_path,
+        conflicts_with = "managed"
+    )]
+    codex_bin: Option<AbsolutePathBuf>,
+
+    /// Clear any persisted custom Codex binary and use the managed standalone install.
+    #[arg(long = "managed", conflicts_with = "codex_bin")]
+    managed: bool,
 }
 
 #[derive(Debug, Args)]
@@ -698,6 +712,11 @@ struct StdioToUdsCommand {
 fn parse_socket_path(raw: &str) -> Result<AbsolutePathBuf, String> {
     AbsolutePathBuf::relative_to_current_dir(raw)
         .map_err(|err| format!("failed to resolve socket path `{raw}`: {err}"))
+}
+
+fn parse_absolute_codex_bin_path(raw: &str) -> Result<AbsolutePathBuf, String> {
+    AbsolutePathBuf::from_absolute_path_checked(raw)
+        .map_err(|err| format!("failed to resolve Codex binary path `{raw}`: {err}"))
 }
 
 fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<String> {
@@ -1158,6 +1177,10 @@ async fn cli_main(
                         let output =
                             codex_app_server_daemon::bootstrap(AppServerBootstrapOptions {
                                 remote_control_enabled: bootstrap_cli.remote_control,
+                                codex_binary_override: bootstrap_codex_binary_override(
+                                    bootstrap_cli.codex_bin,
+                                    bootstrap_cli.managed,
+                                ),
                             })
                             .await?;
                         println!("{}", serde_json::to_string(&output)?);
@@ -2203,6 +2226,17 @@ async fn print_app_server_daemon_output(command: AppServerLifecycleCommand) -> a
     let output = codex_app_server_daemon::run(command).await?;
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
+}
+
+fn bootstrap_codex_binary_override(
+    codex_bin: Option<AbsolutePathBuf>,
+    managed: bool,
+) -> Option<AppServerBootstrapCodexBinaryOverride> {
+    if managed {
+        return Some(AppServerBootstrapCodexBinaryOverride::Managed);
+    }
+
+    codex_bin.map(|path| AppServerBootstrapCodexBinaryOverride::Custom(path.into_path_buf()))
 }
 
 async fn print_app_server_remote_control_output(
@@ -3816,7 +3850,43 @@ mod tests {
             .subcommand,
             Some(AppServerSubcommand::Daemon(AppServerDaemonCommand {
                 subcommand: AppServerDaemonSubcommand::Bootstrap(AppServerBootstrapCommand {
-                    remote_control: true
+                    remote_control: true,
+                    codex_bin: None,
+                    managed: false,
+                })
+            }))
+        ));
+        assert!(matches!(
+            app_server_from_args(
+                [
+                    "codex",
+                    "app-server",
+                    "daemon",
+                    "bootstrap",
+                    "--codex-bin",
+                    "/opt/codex/bin/codex",
+                ]
+                .as_ref()
+            )
+            .subcommand,
+            Some(AppServerSubcommand::Daemon(AppServerDaemonCommand {
+                subcommand: AppServerDaemonSubcommand::Bootstrap(AppServerBootstrapCommand {
+                    remote_control: false,
+                    codex_bin: Some(_),
+                    managed: false,
+                })
+            }))
+        ));
+        assert!(matches!(
+            app_server_from_args(
+                ["codex", "app-server", "daemon", "bootstrap", "--managed"].as_ref()
+            )
+            .subcommand,
+            Some(AppServerSubcommand::Daemon(AppServerDaemonCommand {
+                subcommand: AppServerDaemonSubcommand::Bootstrap(AppServerBootstrapCommand {
+                    remote_control: false,
+                    codex_bin: None,
+                    managed: true,
                 })
             }))
         ));
@@ -3862,6 +3932,35 @@ mod tests {
                 subcommand: AppServerDaemonSubcommand::Version
             }))
         ));
+    }
+
+    #[test]
+    fn app_server_daemon_bootstrap_rejects_conflicting_binary_selection() {
+        let err = MultitoolCli::try_parse_from([
+            "codex",
+            "app-server",
+            "daemon",
+            "bootstrap",
+            "--codex-bin",
+            "/opt/codex/bin/codex",
+            "--managed",
+        ])
+        .expect_err("custom and managed binary selection should conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn app_server_daemon_bootstrap_rejects_relative_codex_bin() {
+        let err = MultitoolCli::try_parse_from([
+            "codex",
+            "app-server",
+            "daemon",
+            "bootstrap",
+            "--codex-bin",
+            "target/release/codex",
+        ])
+        .expect_err("custom binary path must be absolute");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
