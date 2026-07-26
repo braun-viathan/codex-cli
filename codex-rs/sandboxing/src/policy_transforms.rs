@@ -2,6 +2,7 @@ use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -15,6 +16,229 @@ use codex_utils_absolute_path::canonicalize_preserving_symlinks;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
+
+/// Computes the permissions a child may receive from a parent runtime profile.
+///
+/// This is deliberately separate from `intersect_permission_profiles`: that
+/// helper intersects *additional grants*, while this operation must also retain
+/// the outer sandbox enforcement boundary.
+pub fn meet_permission_profiles(
+    parent: &PermissionProfile,
+    requested: &PermissionProfile,
+    cwd: &Path,
+) -> Result<PermissionProfile, String> {
+    let network = meet_network(
+        parent.network_sandbox_policy(),
+        requested.network_sandbox_policy(),
+    );
+    match (parent.enforcement(), requested.enforcement()) {
+        (SandboxEnforcement::Managed, SandboxEnforcement::Managed) => Ok(managed_profile(
+            meet_file_system_policies(
+                &parent.file_system_sandbox_policy(),
+                &requested.file_system_sandbox_policy(),
+                cwd,
+            )?,
+            network,
+        )),
+        // A child may not remove the managed boundary of its parent.
+        (SandboxEnforcement::Managed, _) => Ok(managed_profile(
+            parent.file_system_sandbox_policy(),
+            network,
+        )),
+        // An external boundary remains in force unless the child adds a
+        // managed sandbox within it.
+        (SandboxEnforcement::External, SandboxEnforcement::Managed) => {
+            let requested_file_system = requested.file_system_sandbox_policy();
+            validate_file_system_policy(&requested_file_system, cwd)?;
+            Ok(managed_profile(requested_file_system, network))
+        }
+        (SandboxEnforcement::External, _) => Ok(PermissionProfile::External { network }),
+        // A disabled parent imposes no boundary of its own, so the requested
+        // profile is the child boundary.
+        (SandboxEnforcement::Disabled, SandboxEnforcement::Managed) => {
+            let requested_file_system = requested.file_system_sandbox_policy();
+            validate_file_system_policy(&requested_file_system, cwd)?;
+            Ok(managed_profile(requested_file_system, network))
+        }
+        (SandboxEnforcement::Disabled, SandboxEnforcement::External) => {
+            if network.is_enabled() {
+                Ok(PermissionProfile::Disabled)
+            } else {
+                Ok(managed_profile(
+                    FileSystemSandboxPolicy::unrestricted(),
+                    network,
+                ))
+            }
+        }
+        (SandboxEnforcement::Disabled, SandboxEnforcement::Disabled) => {
+            Ok(PermissionProfile::Disabled)
+        }
+    }
+}
+
+fn meet_network(
+    parent: NetworkSandboxPolicy,
+    requested: NetworkSandboxPolicy,
+) -> NetworkSandboxPolicy {
+    if parent.is_enabled() && requested.is_enabled() {
+        NetworkSandboxPolicy::Enabled
+    } else {
+        NetworkSandboxPolicy::Restricted
+    }
+}
+
+fn managed_profile(
+    policy: FileSystemSandboxPolicy,
+    network: NetworkSandboxPolicy,
+) -> PermissionProfile {
+    PermissionProfile::from_runtime_permissions_with_enforcement(
+        SandboxEnforcement::Managed,
+        &policy,
+        network,
+    )
+}
+
+fn meet_file_system_policies(
+    parent: &FileSystemSandboxPolicy,
+    requested: &FileSystemSandboxPolicy,
+    cwd: &Path,
+) -> Result<FileSystemSandboxPolicy, String> {
+    match (parent.kind, requested.kind) {
+        (FileSystemSandboxKind::Unrestricted, _) => {
+            validate_file_system_policy(requested, cwd)?;
+            Ok(requested.clone())
+        }
+        (_, FileSystemSandboxKind::Unrestricted) => {
+            validate_file_system_policy(parent, cwd)?;
+            Ok(parent.clone())
+        }
+        (FileSystemSandboxKind::Restricted, FileSystemSandboxKind::Restricted) => {
+            let parent_deny_matcher = ReadDenyMatcher::try_new(parent, cwd)?;
+            let requested_deny_matcher = ReadDenyMatcher::try_new(requested, cwd)?;
+            let mut entries = Vec::new();
+            for parent_entry in parent
+                .entries
+                .iter()
+                .filter(|entry| entry.access.can_read())
+            {
+                let parent_entry = materialize_cwd_dependent_entry(parent_entry, cwd);
+                for requested_entry in requested
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.access.can_read())
+                {
+                    let requested_entry = materialize_cwd_dependent_entry(requested_entry, cwd);
+                    if parent_entry.path == requested_entry.path
+                        && matches!(parent_entry.path, FileSystemPath::Special { .. })
+                    {
+                        push_unique(
+                            &mut entries,
+                            FileSystemSandboxEntry {
+                                path: parent_entry.path.clone(),
+                                access: if parent_entry.access.can_write()
+                                    && requested_entry.access.can_write()
+                                {
+                                    FileSystemAccessMode::Write
+                                } else {
+                                    FileSystemAccessMode::Read
+                                },
+                            },
+                        );
+                        continue;
+                    }
+                    let (Some(parent_path), Some(requested_path)) = (
+                        resolve_permission_path(&parent_entry.path, cwd),
+                        resolve_permission_path(&requested_entry.path, cwd),
+                    ) else {
+                        // Unequal unresolved paths cannot prove an overlapping
+                        // grant, so omitting the pair is the fail-closed meet.
+                        continue;
+                    };
+                    if !paths_overlap(parent_path.as_path(), requested_path.as_path()) {
+                        continue;
+                    }
+                    let path = if parent_path.starts_with(requested_path.as_path()) {
+                        parent_path
+                    } else {
+                        requested_path
+                    };
+                    let parent_access = parent.resolve_access_with_cwd(path.as_path(), cwd);
+                    let requested_access = requested.resolve_access_with_cwd(path.as_path(), cwd);
+                    if !parent_access.can_read() || !requested_access.can_read() {
+                        continue;
+                    }
+                    let access = if parent_access.can_write() && requested_access.can_write() {
+                        FileSystemAccessMode::Write
+                    } else {
+                        FileSystemAccessMode::Read
+                    };
+                    if parent_deny_matcher
+                        .as_ref()
+                        .is_some_and(|matcher| matcher.is_read_denied(path.as_path()))
+                        || requested_deny_matcher
+                            .as_ref()
+                            .is_some_and(|matcher| matcher.is_read_denied(path.as_path()))
+                    {
+                        continue;
+                    }
+                    push_unique(
+                        &mut entries,
+                        FileSystemSandboxEntry {
+                            path: FileSystemPath::Path { path },
+                            access,
+                        },
+                    );
+                }
+            }
+            let mut parent_deny_entries = Vec::new();
+            let mut requested_deny_entries = Vec::new();
+            for (source, deny_entries) in [
+                (&parent.entries, &mut parent_deny_entries),
+                (&requested.entries, &mut requested_deny_entries),
+            ] {
+                for entry in source {
+                    if entry.access == FileSystemAccessMode::Deny {
+                        let entry = materialize_cwd_dependent_entry(entry, cwd);
+                        push_unique(&mut entries, entry.clone());
+                        push_unique(deny_entries, entry);
+                    }
+                }
+            }
+            Ok(FileSystemSandboxPolicy {
+                kind: FileSystemSandboxKind::Restricted,
+                glob_scan_max_depth: merge_glob_scan_max_depth(
+                    &parent_deny_entries,
+                    parent.glob_scan_max_depth,
+                    &requested_deny_entries,
+                    requested.glob_scan_max_depth,
+                ),
+                entries,
+            })
+        }
+        _ => Err(
+            "managed permission profiles cannot contain external filesystem policies".to_string(),
+        ),
+    }
+}
+
+fn validate_file_system_policy(policy: &FileSystemSandboxPolicy, cwd: &Path) -> Result<(), String> {
+    for entry in &policy.entries {
+        let entry = materialize_cwd_dependent_entry(entry, cwd);
+        if matches!(entry.path, FileSystemPath::GlobPattern { .. })
+            && entry.access != FileSystemAccessMode::Deny
+        {
+            return Err("glob file system permissions only support deny-read entries".to_string());
+        }
+    }
+    ReadDenyMatcher::try_new(policy, cwd)?;
+    Ok(())
+}
+
+fn push_unique(entries: &mut Vec<FileSystemSandboxEntry>, entry: FileSystemSandboxEntry) {
+    if !entries.contains(&entry) {
+        entries.push(entry);
+    }
+}
 
 pub fn normalize_additional_permissions(
     additional_permissions: AdditionalPermissionProfile,

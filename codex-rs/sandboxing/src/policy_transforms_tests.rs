@@ -1,11 +1,15 @@
 use super::effective_file_system_sandbox_policy;
 use super::intersect_permission_profiles;
+use super::meet_permission_profiles;
 use super::merge_file_system_policy_with_additional_permissions;
 use super::normalize_additional_permissions;
 use super::should_require_platform_sandbox;
 use codex_protocol::models::AdditionalPermissionProfile as PermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
+use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::NetworkPermissions;
+use codex_protocol::models::PermissionProfile as RuntimePermissionProfile;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -18,6 +22,209 @@ use pretty_assertions::assert_eq;
 #[cfg(unix)]
 use std::path::Path;
 use tempfile::TempDir;
+
+fn managed(
+    entries: Vec<FileSystemSandboxEntry>,
+    network: NetworkSandboxPolicy,
+) -> RuntimePermissionProfile {
+    RuntimePermissionProfile::Managed {
+        file_system: ManagedFileSystemPermissions::Restricted {
+            entries,
+            glob_scan_max_depth: None,
+        },
+        network,
+    }
+}
+
+fn unrestricted(network: NetworkSandboxPolicy) -> RuntimePermissionProfile {
+    RuntimePermissionProfile::Managed {
+        file_system: ManagedFileSystemPermissions::Unrestricted,
+        network,
+    }
+}
+
+fn entry(path: AbsolutePathBuf, access: FileSystemAccessMode) -> FileSystemSandboxEntry {
+    FileSystemSandboxEntry {
+        path: FileSystemPath::Path { path },
+        access,
+    }
+}
+
+#[test]
+fn meet_permission_profiles_enforces_all_parent_requested_enforcement_pairs() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let managed_enabled = managed(Vec::new(), NetworkSandboxPolicy::Enabled);
+    let managed_restricted = managed(Vec::new(), NetworkSandboxPolicy::Restricted);
+    let disabled = RuntimePermissionProfile::Disabled;
+    let external = RuntimePermissionProfile::External {
+        network: NetworkSandboxPolicy::Enabled,
+    };
+    let cases = [
+        (&managed_enabled, &managed_enabled, "managed", true),
+        (&managed_enabled, &disabled, "managed", true),
+        (&managed_enabled, &external, "managed", true),
+        (&disabled, &managed_enabled, "managed", true),
+        (&disabled, &disabled, "disabled", true),
+        (&disabled, &external, "disabled", true),
+        (&external, &managed_enabled, "managed", true),
+        (&external, &disabled, "external", true),
+        (&external, &external, "external", true),
+        (&managed_enabled, &managed_restricted, "managed", false),
+        (&external, &managed_restricted, "managed", false),
+    ];
+    for (parent, requested, expected, network_enabled) in cases {
+        let actual = meet_permission_profiles(parent, requested, temp_dir.path()).expect("meet");
+        assert_eq!(
+            match &actual {
+                RuntimePermissionProfile::Managed { .. } => "managed",
+                RuntimePermissionProfile::Disabled => "disabled",
+                RuntimePermissionProfile::External { .. } => "external",
+            },
+            expected,
+        );
+        assert_eq!(
+            actual.network_sandbox_policy().is_enabled(),
+            network_enabled
+        );
+    }
+}
+
+#[test]
+fn meet_permission_profiles_intersects_nested_access_and_preserves_denies() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let root = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute");
+    let child = root.join("child");
+    let parent_deny = root.join("parent-deny");
+    let requested_deny = child.join("requested-deny");
+    let parent = managed(
+        vec![
+            entry(root, FileSystemAccessMode::Write),
+            entry(parent_deny.clone(), FileSystemAccessMode::Deny),
+        ],
+        NetworkSandboxPolicy::Enabled,
+    );
+    let requested = managed(
+        vec![
+            entry(child.clone(), FileSystemAccessMode::Read),
+            entry(requested_deny.clone(), FileSystemAccessMode::Deny),
+        ],
+        NetworkSandboxPolicy::Enabled,
+    );
+    assert_eq!(
+        meet_permission_profiles(
+            &parent,
+            &unrestricted(NetworkSandboxPolicy::Enabled),
+            temp_dir.path(),
+        )
+        .expect("meet"),
+        parent
+    );
+    let actual = meet_permission_profiles(&parent, &requested, temp_dir.path()).expect("meet");
+    let RuntimePermissionProfile::Managed {
+        file_system: ManagedFileSystemPermissions::Restricted { entries, .. },
+        ..
+    } = actual
+    else {
+        panic!("managed restricted")
+    };
+    assert!(entries.contains(&entry(child, FileSystemAccessMode::Read)));
+    assert!(entries.contains(&entry(parent_deny, FileSystemAccessMode::Deny)));
+    assert!(entries.contains(&entry(requested_deny, FileSystemAccessMode::Deny)));
+}
+
+#[test]
+fn meet_permission_profiles_preserves_more_specific_read_carveout() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let root = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute");
+    let child = root.join("child");
+    let parent = managed(
+        vec![
+            entry(root, FileSystemAccessMode::Write),
+            entry(child.clone(), FileSystemAccessMode::Read),
+        ],
+        NetworkSandboxPolicy::Restricted,
+    );
+    let requested = managed(
+        vec![entry(child.clone(), FileSystemAccessMode::Write)],
+        NetworkSandboxPolicy::Restricted,
+    );
+
+    let actual = meet_permission_profiles(&parent, &requested, temp_dir.path()).expect("meet");
+    let policy = actual.file_system_sandbox_policy();
+
+    assert!(policy.can_read_path_with_cwd(child.as_path(), temp_dir.path()));
+    assert!(!policy.can_write_path_with_cwd(child.as_path(), temp_dir.path()));
+}
+
+#[test]
+fn meet_permission_profiles_intersects_workspace_write_with_read_only() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let nested_path = temp_dir.path().join("nested");
+
+    let actual = meet_permission_profiles(
+        &RuntimePermissionProfile::workspace_write(),
+        &RuntimePermissionProfile::read_only(),
+        temp_dir.path(),
+    )
+    .expect("workspace-write and read-only profiles should meet");
+    let policy = actual.file_system_sandbox_policy();
+
+    assert_eq!(actual.enforcement(), SandboxEnforcement::Managed);
+    assert_eq!(
+        actual.network_sandbox_policy(),
+        NetworkSandboxPolicy::Restricted
+    );
+    assert_eq!(
+        policy.resolve_access_with_cwd(temp_dir.path(), temp_dir.path()),
+        FileSystemAccessMode::Read
+    );
+    assert_eq!(
+        policy.resolve_access_with_cwd(nested_path.as_path(), temp_dir.path()),
+        FileSystemAccessMode::Read
+    );
+}
+
+#[test]
+fn meet_permission_profiles_preserves_deny_glob_depth() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let root = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute");
+    let deny_glob = FileSystemSandboxEntry {
+        path: FileSystemPath::GlobPattern {
+            pattern: "**/*.env".to_string(),
+        },
+        access: FileSystemAccessMode::Deny,
+    };
+    let parent = RuntimePermissionProfile::Managed {
+        file_system: ManagedFileSystemPermissions::Restricted {
+            entries: vec![entry(root.clone(), FileSystemAccessMode::Read), deny_glob],
+            glob_scan_max_depth: std::num::NonZeroUsize::new(2),
+        },
+        network: NetworkSandboxPolicy::Restricted,
+    };
+    let requested = managed(
+        vec![entry(root.clone(), FileSystemAccessMode::Read)],
+        NetworkSandboxPolicy::Restricted,
+    );
+    let actual = meet_permission_profiles(&parent, &requested, temp_dir.path()).expect("meet");
+    let RuntimePermissionProfile::Managed {
+        file_system:
+            ManagedFileSystemPermissions::Restricted {
+                entries,
+                glob_scan_max_depth,
+            },
+        ..
+    } = actual
+    else {
+        panic!("managed")
+    };
+    assert!(entries.contains(&FileSystemSandboxEntry {
+        path: FileSystemPath::GlobPattern {
+            pattern: root.join("**/*.env").to_string_lossy().into_owned(),
+        },
+        access: FileSystemAccessMode::Deny,
+    }));
+    assert_eq!(glob_scan_max_depth.map(usize::from), Some(2));
+}
 
 #[cfg(unix)]
 fn symlink_dir(original: &Path, link: &Path) -> std::io::Result<()> {

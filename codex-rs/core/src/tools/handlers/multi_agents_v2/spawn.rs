@@ -60,6 +60,7 @@ async fn handle_spawn_agent(
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+    let parent_permission_baseline = runtime_permission_baseline(&config);
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }
@@ -85,7 +86,16 @@ async fn handle_spawn_agent(
         args.service_tier.as_deref(),
     )
     .await?;
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    #[allow(deprecated)]
+    let parent_cwd = turn.cwd.clone();
+    reapply_runtime_permissions_after_role(
+        &mut config,
+        turn.approval_policy.value(),
+        turn.config.approvals_reviewer,
+        parent_cwd,
+        parent_permission_baseline,
+    )
+    .map_err(FunctionCallError::RespondToModel)?;
 
     let spawn_source = thread_spawn_source(
         session.thread_id,

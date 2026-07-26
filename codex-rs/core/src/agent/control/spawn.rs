@@ -1,7 +1,8 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
 use crate::agent::role::apply_role_to_config;
-use crate::config::PermissionProfileSnapshot;
+use crate::tools::handlers::multi_agents_common::reapply_runtime_permissions_after_role;
+use crate::tools::handlers::multi_agents_common::runtime_permission_baseline;
 use codex_extension_api::ExtensionDataInit;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
@@ -288,37 +289,19 @@ impl AgentControl {
             let runtime_approval_policy = config.permissions.approval_policy.value();
             let runtime_approvals_reviewer = config.approvals_reviewer;
             let runtime_cwd = config.cwd.clone();
-            let runtime_permission_profile = match config.permissions.active_permission_profile() {
-                Some(active_permission_profile) => {
-                    PermissionProfileSnapshot::active_with_profile_workspace_roots(
-                        config.permissions.permission_profile().clone(),
-                        active_permission_profile,
-                        config.permissions.profile_workspace_roots().to_vec(),
-                    )
-                }
-                None => PermissionProfileSnapshot::legacy(
-                    config.permissions.permission_profile().clone(),
-                ),
-            };
+            let runtime_permission_baseline = runtime_permission_baseline(&config);
 
             apply_role_to_config(&mut config, Some(&role_name))
                 .await
                 .map_err(CodexErr::InvalidRequest)?;
-            config
-                .permissions
-                .approval_policy
-                .set(runtime_approval_policy)
-                .map_err(|err| {
-                    CodexErr::InvalidRequest(format!("approval_policy is invalid: {err}"))
-                })?;
-            config.approvals_reviewer = runtime_approvals_reviewer;
-            config.cwd = runtime_cwd;
-            config
-                .permissions
-                .set_permission_profile_from_session_snapshot(runtime_permission_profile)
-                .map_err(|err| {
-                    CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
-                })?;
+            reapply_runtime_permissions_after_role(
+                &mut config,
+                runtime_approval_policy,
+                runtime_approvals_reviewer,
+                runtime_cwd,
+                runtime_permission_baseline,
+            )
+            .map_err(CodexErr::InvalidRequest)?;
         }
         let residency_slot = self
             .reserve_v2_residency_slot(&state, &config, Some(thread_id))

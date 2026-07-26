@@ -206,7 +206,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
             ROLE_MODEL.to_string(),
             ROLE_MODEL_PROVIDER_ID.to_string(),
             Some(ReasoningEffort::High),
-            PermissionProfile::Disabled,
+            PermissionProfile::read_only(),
         )
     );
     worker_thread.flush_rollout().await?;

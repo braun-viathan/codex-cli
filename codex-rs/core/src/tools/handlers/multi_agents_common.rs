@@ -2,6 +2,8 @@ use crate::agent::role::apply_role_to_config;
 use crate::config::Config;
 use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
+use crate::config::NetworkProxySpec;
+use crate::config::PermissionProfileSnapshot;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -11,16 +13,21 @@ use crate::tools::context::ToolPayload;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::NetworkSandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
@@ -232,12 +239,148 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
     #[allow(deprecated)]
     let turn_cwd = turn.cwd.clone();
     config.cwd = turn_cwd;
+    let turn_permission_profile = turn.permission_profile();
+    if turn_permission_profile != config.permissions.effective_permission_profile() {
+        config
+            .permissions
+            .set_permission_profile(turn_permission_profile.clone())
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
+            })?;
+    }
+    config.permissions.network = recompute_network_proxy_spec(
+        config.permissions.network.as_ref(),
+        &turn_permission_profile,
+    )
+    .map_err(FunctionCallError::RespondToModel)?;
+    Ok(())
+}
+
+/// Runtime permissions plus their active-profile identity, when the concrete profile still
+/// exactly matches a configured profile.
+pub(crate) struct RuntimePermissionBaseline {
+    snapshot: PermissionProfileSnapshot,
+    effective_permission_profile: PermissionProfile,
+    config_workspace_roots: Vec<AbsolutePathBuf>,
+    permission_workspace_roots: Vec<AbsolutePathBuf>,
+    workspace_roots_explicit: bool,
+    network: Option<NetworkProxySpec>,
+}
+
+/// Captures both the effective runtime profile and any active-profile identity.
+pub(crate) fn runtime_permission_baseline(config: &Config) -> RuntimePermissionBaseline {
+    let snapshot = match config.permissions.active_permission_profile() {
+        Some(active_permission_profile) => {
+            PermissionProfileSnapshot::active_with_profile_workspace_roots(
+                config.permissions.permission_profile().clone(),
+                active_permission_profile,
+                config.permissions.profile_workspace_roots().to_vec(),
+            )
+        }
+        None => PermissionProfileSnapshot::legacy(config.permissions.permission_profile().clone()),
+    };
+    RuntimePermissionBaseline {
+        snapshot,
+        effective_permission_profile: config.permissions.effective_permission_profile(),
+        config_workspace_roots: config.workspace_roots.clone(),
+        permission_workspace_roots: config.permissions.workspace_roots().to_vec(),
+        workspace_roots_explicit: config.workspace_roots_explicit,
+        network: config.permissions.network.clone(),
+    }
+}
+
+fn recompute_network_proxy_spec(
+    network: Option<&NetworkProxySpec>,
+    permission_profile: &PermissionProfile,
+) -> Result<Option<NetworkProxySpec>, String> {
+    network
+        .map(|network| {
+            network
+                .recompute_for_permission_profile(permission_profile)
+                .map_err(|err| format!("network proxy policy is invalid: {err}"))
+        })
+        .transpose()
+}
+
+/// Meets the managed proxy state without silently discarding either side's restrictions.
+///
+/// Restricted sandbox networking needs no proxy. When sandbox networking is enabled, a proxy
+/// present on only one side is the narrower choice. Two different proxy policies cannot be safely
+/// intersected with the current opaque proxy representation, so reject them instead.
+fn meet_network_proxy_specs(
+    parent_network: Option<&NetworkProxySpec>,
+    role_network: Option<&NetworkProxySpec>,
+    permission_profile: &PermissionProfile,
+) -> Result<Option<NetworkProxySpec>, String> {
+    if permission_profile.network_sandbox_policy() == NetworkSandboxPolicy::Restricted {
+        return Ok(None);
+    }
+
+    let parent_network = recompute_network_proxy_spec(parent_network, permission_profile)?;
+    let role_network = recompute_network_proxy_spec(role_network, permission_profile)?;
+    match (parent_network, role_network) {
+        (Some(parent_network), Some(role_network)) if parent_network != role_network => {
+            Err("parent and role network proxy policies cannot be safely intersected".to_string())
+        }
+        (Some(parent_network), Some(_)) | (Some(parent_network), None) => Ok(Some(parent_network)),
+        (None, Some(role_network)) => Ok(Some(role_network)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Restores parent-owned runtime settings after a role layer while retaining any role narrowing.
+///
+/// A synthesized meet intentionally has legacy identity: neither the parent nor role profile
+/// exactly describes it. Config constraints remain authoritative when the result is installed.
+pub(crate) fn reapply_runtime_permissions_after_role(
+    config: &mut Config,
+    parent_approval_policy: AskForApproval,
+    parent_approvals_reviewer: ApprovalsReviewer,
+    parent_cwd: AbsolutePathBuf,
+    parent_permission_baseline: RuntimePermissionBaseline,
+) -> Result<(), String> {
+    config.workspace_roots = parent_permission_baseline.config_workspace_roots.clone();
+    config.workspace_roots_explicit = parent_permission_baseline.workspace_roots_explicit;
+    config.permissions.set_workspace_roots(
+        parent_permission_baseline
+            .permission_workspace_roots
+            .clone(),
+    );
+    let role_permission_baseline = runtime_permission_baseline(config);
+    let effective_permission_profile =
+        codex_sandboxing::policy_transforms::meet_permission_profiles(
+            &parent_permission_baseline.effective_permission_profile,
+            &role_permission_baseline.effective_permission_profile,
+            parent_cwd.as_path(),
+        )?;
+    let permission_snapshot =
+        if effective_permission_profile == role_permission_baseline.effective_permission_profile {
+            role_permission_baseline.snapshot
+        } else if effective_permission_profile
+            == parent_permission_baseline.effective_permission_profile
+        {
+            parent_permission_baseline.snapshot
+        } else {
+            PermissionProfileSnapshot::legacy(effective_permission_profile)
+        };
+    let network = meet_network_proxy_specs(
+        parent_permission_baseline.network.as_ref(),
+        role_permission_baseline.network.as_ref(),
+        permission_snapshot.permission_profile(),
+    )?;
+
     config
         .permissions
-        .set_permission_profile(turn.permission_profile())
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
-        })?;
+        .approval_policy
+        .set(parent_approval_policy)
+        .map_err(|err| format!("approval_policy is invalid: {err}"))?;
+    config.approvals_reviewer = parent_approvals_reviewer;
+    config.cwd = parent_cwd;
+    config
+        .permissions
+        .set_permission_profile_from_session_snapshot(permission_snapshot)
+        .map_err(|err| format!("permission_profile is invalid: {err}"))?;
+    config.permissions.network = network;
     Ok(())
 }
 
@@ -442,3 +585,7 @@ fn validate_spawn_agent_reasoning_effort(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     )))
 }
+
+#[cfg(test)]
+#[path = "multi_agents_common_tests.rs"]
+mod tests;

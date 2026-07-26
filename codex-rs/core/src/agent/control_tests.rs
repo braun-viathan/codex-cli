@@ -644,6 +644,19 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
+    let role_name = "read-only-role".to_string();
+    let role_config_path = config.codex_home.join("read-only-role.toml");
+    tokio::fs::write(&role_config_path, "sandbox_mode = \"read-only\"\n")
+        .await
+        .expect("role config should be written");
+    config.agent_roles.insert(
+        role_name.clone(),
+        AgentRoleConfig {
+            description: Some("Role that narrows sandbox permissions".to_string()),
+            config_file: Some(role_config_path.to_path_buf()),
+            nickname_candidates: None,
+        },
+    );
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, _parent_thread) = harness.start_paginated_thread().await;
     let agent_path = AgentPath::try_from("/root/worker").expect("agent path");
@@ -657,7 +670,7 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
                 depth: 1,
                 agent_path: Some(agent_path.clone()),
                 agent_nickname: None,
-                agent_role: None,
+                agent_role: Some(role_name),
             })),
             SpawnAgentOptions {
                 parent_thread_id: Some(parent_thread_id),
@@ -708,11 +721,15 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
         .ensure_v2_agent_loaded(harness.config.clone(), spawned_agent.thread_id)
         .await
         .expect("known v2 agent should reload");
-    let _ = harness
+    let reloaded_child = harness
         .manager
         .get_thread(spawned_agent.thread_id)
         .await
         .expect("reloaded child thread should exist");
+    assert_eq!(
+        reloaded_child.config_snapshot().await.permission_profile,
+        PermissionProfile::read_only()
+    );
 
     let communication = InterAgentCommunication::new(
         AgentPath::root(),

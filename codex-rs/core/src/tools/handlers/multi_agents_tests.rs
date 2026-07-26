@@ -2262,7 +2262,7 @@ async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
 }
 
 #[tokio::test]
-async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
+async fn spawn_agent_meets_runtime_and_role_permission_profiles() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         agent_id: String,
@@ -2302,6 +2302,36 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         turn.config.permissions.effective_permission_profile(),
         "test requires a runtime profile override that differs from base config"
     );
+    tokio::fs::create_dir_all(&turn.config.codex_home)
+        .await
+        .expect("codex home should be created");
+    let role_name = "read-only-role".to_string();
+    let role_config_path = turn.config.codex_home.join("read-only-role.toml");
+    tokio::fs::write(&role_config_path, "sandbox_mode = \"read-only\"\n")
+        .await
+        .expect("role config should be written");
+    let mut config = (*turn.config).clone();
+    config.agent_roles.insert(
+        role_name.clone(),
+        AgentRoleConfig {
+            description: Some("Role that narrows sandbox permissions".to_string()),
+            config_file: Some(role_config_path.to_path_buf()),
+            nickname_candidates: None,
+        },
+    );
+    set_turn_config(&mut turn, config);
+    let mut role_config = (*turn.config).clone();
+    apply_spawn_agent_role(&session, &mut role_config, Some(&role_name))
+        .await
+        .expect("role should apply");
+    #[allow(deprecated)]
+    let expected_role_permission_profile =
+        codex_sandboxing::policy_transforms::meet_permission_profiles(
+            &turn.permission_profile,
+            &role_config.permissions.effective_permission_profile(),
+            &turn.cwd,
+        )
+        .expect("permission meet should succeed");
 
     let invocation = invocation(
         Arc::new(session),
@@ -2309,7 +2339,7 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         "spawn_agent",
         function_payload(json!({
             "message": "await this command",
-            "agent_type": "explorer"
+            "agent_type": role_name
         })),
     );
     let output = SpawnAgentHandler::default()
@@ -2333,10 +2363,13 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         .expect("spawned agent thread should exist")
         .config_snapshot()
         .await;
-    assert_eq!(snapshot.sandbox_policy(), expected_sandbox);
+    assert_ne!(snapshot.permission_profile, expected_permission_profile);
     assert_eq!(snapshot.approval_policy, AskForApproval::OnRequest);
     assert_eq!(snapshot.approvals_reviewer, ApprovalsReviewer::AutoReview);
-    assert_eq!(snapshot.permission_profile, expected_permission_profile);
+    assert_eq!(
+        snapshot.permission_profile,
+        expected_role_permission_profile
+    );
     let child_thread = manager
         .get_thread(agent_id)
         .await
@@ -2344,13 +2377,16 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
     let child_turn = child_thread.session.new_default_turn().await;
     assert_eq!(
         child_turn.file_system_sandbox_policy(),
-        expected_file_system_sandbox_policy
+        expected_role_permission_profile.file_system_sandbox_policy()
     );
     assert_eq!(
         child_turn.network_sandbox_policy(),
-        expected_network_sandbox_policy
+        expected_role_permission_profile.network_sandbox_policy()
     );
-    assert_eq!(child_turn.permission_profile(), expected_permission_profile);
+    assert_eq!(
+        child_turn.permission_profile(),
+        expected_role_permission_profile
+    );
 }
 
 #[tokio::test]
